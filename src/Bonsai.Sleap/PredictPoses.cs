@@ -2,7 +2,6 @@
 using System.Linq;
 using System.Reactive.Linq;
 using OpenCV.Net;
-using TensorFlow;
 using System.ComponentModel;
 
 namespace Bonsai.Sleap
@@ -20,22 +19,13 @@ namespace Bonsai.Sleap
     public class PredictPoses : Transform<IplImage, PoseCollection>
     {
         /// <summary>
-        /// Gets or sets a value specifying the path to the exported Protocol Buffer
+        /// Gets or sets a value specifying the path to the exported ONNX
         /// file containing the pretrained SLEAP model.
         /// </summary>
-        [FileNameFilter("Protocol Buffer Files(*.pb)|*.pb")]
+        [FileNameFilter("ONNX Files(*.onnx)|*.onnx")]
         [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", DesignTypes.UITypeEditor)]
-        [Description("Specifies the path to the exported Protocol Buffer file containing the pretrained SLEAP model.")]
+        [Description("Specifies the path to the exported ONNX file containing the pretrained SLEAP model.")]
         public string ModelFileName { get; set; }
-
-        /// <summary>
-        /// Gets or sets a value specifying the path to the configuration JSON file
-        /// containing training metadata.
-        /// </summary>
-        [FileNameFilter("Config Files(*.json)|*.json|All Files|*.*")]
-        [Editor("Bonsai.Design.OpenFileNameEditor, Bonsai.Design", DesignTypes.UITypeEditor)]
-        [Description("Specifies the path to the configuration JSON file containing training metadata.")]
-        public string TrainingConfig { get; set; }
 
         /// <summary>
         /// Gets or sets a value specifying the confidence threshold used to discard centroid
@@ -56,11 +46,12 @@ namespace Bonsai.Sleap
         public float? PartMinConfidence { get; set; }
 
         /// <summary>
-        /// Gets or sets a value specifying the scale factor used to resize video frames
+        /// Gets or sets a value specifying a target size used to resize video frames
         /// for inference. If no value is specified, no resizing is performed.
         /// </summary>
-        [Description("Specifies the scale factor used to resize video frames for inference. If no value is specified, no resizing is performed.")]
-        public float? ScaleFactor { get; set; }
+        [TypeConverter(typeof(NumericRecordConverter))]
+        [Description("Specifies the target size used to resize video frames for inference. If no value is specified, no resizing is performed.")]
+        public Size? InputSize { get; set; }
 
         /// <summary>
         /// Gets or sets a value specifying the optional color conversion used to prepare
@@ -70,138 +61,80 @@ namespace Bonsai.Sleap
         [Description("Specifies the optional color conversion used to prepare RGB video frames for inference. If no value is specified, no color conversion is performed.")]
         public ColorConversion? ColorConversion { get; set; }
 
+        /// <summary>
+        /// Gets or sets the ONNX runtime execution provider used to perform model inference.
+        /// </summary>
+        [Description("The ONNX runtime execution provider used to perform model inference.")]
+        public ExecutionProvider ExecutionProvider { get; set; } = ExecutionProvider.Cpu;
+
         private IObservable<PoseCollection> Process(IObservable<IplImage[]> source)
         {
             return Observable.Defer(() =>
             {
-                IplImage resizeTemp = null;
-                IplImage colorTemp = null;
-                TFTensor tensor = null;
-                TFSession.Runner runner = null;
-                var graph = TensorHelper.ImportModel(ModelFileName, out TFSession session);
-                var config = ConfigHelper.LoadTrainingConfig(TrainingConfig);
-                var ragged = graph["Identity_6"] != null;
-
-                if (config.ModelType != ModelType.CenteredInstance)
+                var session = RuntimeHelper.ImportModel(ModelFileName, ExecutionProvider, out var exportMetadata);
+                if (exportMetadata.ModelType != ModelType.TopDown)
                 {
-                    throw new UnexpectedModelTypeException($"Expected {nameof(ModelType.CenteredInstance)} model type but found {config.ModelType} .");
+                    throw new UnexpectedModelTypeException($"Expected {nameof(ModelType.CenteredInstance)} model type but found {exportMetadata.ModelType}.");
                 }
 
-                return source.Select(input =>
+                var inputName = session.InputMetadata.Keys.First();
+                var frameBatch = new FrameBatch(inputName, InputSize, ColorConversion, exportMetadata);
+
+                return source.Select(frames =>
                 {
-                    var poseScale = 1.0;
-                    int colorChannels = (ColorConversion is null) ? input[0].Channels : ExtensionMethods.GetConversionNumChannels((ColorConversion)ColorConversion);
-                    var tensorSize = input[0].Size;
-                    var batchSize = input.Length;
-                    var scaleFactor = ScaleFactor;
+                    frameBatch.Update(frames);
+                    using var output = session.Run(frameBatch.Inputs);
 
-                    if (scaleFactor.HasValue)
+                    var poseCollection = new PoseCollection(frames[0], exportMetadata);
+                    var centroidTensor = output[0].AsTensor<float>();
+                    var instanceCount = centroidTensor.Dimensions[1];
+                    if (instanceCount == 0)
+                        return poseCollection;
+
+                    var centroidConfidenceTensor = output[1].AsTensor<float>();
+                    var poseTensor = output[2].AsTensor<float>();
+                    var partConfTensor = output[3].AsTensor<float>();
+                    var instanceValidTensor = output[4].AsTensor<bool>();
+                    var partCount = partConfTensor.Dimensions[2];
+
+                    var partThreshold = PartMinConfidence;
+                    var centroidThreshold = CentroidMinConfidence;
+
+                    for (int i = 0; i < instanceCount; i++)
                     {
-                        poseScale = scaleFactor.Value;
-                        tensorSize.Width = (int)(tensorSize.Width * poseScale);
-                        tensorSize.Height = (int)(tensorSize.Height * poseScale);
-                        poseScale = 1.0 / poseScale;
-                    }
+                        var centroidConfidence = centroidConfidenceTensor.GetValue(i);
+                        if (centroidConfidence < centroidThreshold || !instanceValidTensor.GetValue(i))
+                            continue;
 
-                    if (tensor == null || tensor.Shape[0] != batchSize || tensor.Shape[1] != tensorSize.Height || tensor.Shape[2] != tensorSize.Width)
-                    {
-                        tensor?.Dispose();
-                        runner = session.GetRunner();
-                        tensor = TensorHelper.CreatePlaceholder(graph, runner, tensorSize, batchSize, colorChannels);
+                        var pose = new Pose(frames[0], exportMetadata);
+                        var centroid = new BodyPart();
+                        centroid.Name = exportMetadata.AnchorPart;
+                        centroid.Confidence = centroidConfidence;
+                        centroid.Position = new Point2f(
+                            x: (float)centroidTensor.GetValue(i * 2),
+                            y: (float)centroidTensor.GetValue(i * 2 + 1));
+                        pose.Centroid = centroid;
 
-                        if (ragged)
+                        for (int j = 0; j < partCount; j++)
                         {
-                            // ragged version of the frozen graph
-                            runner.Fetch(graph["Identity"][0]);
-                            runner.Fetch(graph["Identity_2"][0]);
-                            runner.Fetch(graph["Identity_4"][0]);
-                            runner.Fetch(graph["Identity_6"][0]);
-                        }
-                        else
-                        {
-                            // unragged version of the frozen graph
-                            runner.Fetch(graph["Identity"][0]);
-                            runner.Fetch(graph["Identity_1"][0]);
-                            runner.Fetch(graph["Identity_2"][0]);
-                            runner.Fetch(graph["Identity_3"][0]);
-                        }
-                    }
-
-                    var frames = Array.ConvertAll(input, frame =>
-                    {
-                        frame = TensorHelper.EnsureFrameSize(frame, tensorSize, ref resizeTemp);
-                        frame = TensorHelper.EnsureColorFormat(frame, ColorConversion, ref colorTemp, colorChannels);
-                        return frame;
-
-                    });
-                    TensorHelper.UpdateTensor(tensor, colorChannels, frames);
-                    var output = runner.Run();
-
-                    var shapeIdx = ragged ? 0 : 1;
-                    var poseCollection = new PoseCollection(input[0], config);
-                    if (output[0].Shape[shapeIdx] == 0) return poseCollection;
-                    else
-                    {
-                        var centroidConfidenceTensor = output[0];
-                        float[] centroidConfArr = new float[centroidConfidenceTensor.Shape[shapeIdx]];
-                        TensorHelper.GetTensorValue(centroidConfidenceTensor, centroidConfArr);
-
-                        var centroidTensor = output[1];
-                        float[,] centroidArr = new float[centroidTensor.Shape[shapeIdx], centroidTensor.Shape[shapeIdx + 1]];
-                        TensorHelper.GetTensorValue(centroidTensor, centroidArr);
-
-                        var partConfTensor = output[2];
-                        float[,] partConfArr = new float[partConfTensor.Shape[shapeIdx], partConfTensor.Shape[shapeIdx + 1]];
-                        TensorHelper.GetTensorValue(partConfTensor, partConfArr);
-
-                        var poseTensor = output[3];
-                        float[,,] poseArr = new float[poseTensor.Shape[shapeIdx], poseTensor.Shape[shapeIdx + 1], poseTensor.Shape[shapeIdx + 2]];
-                        TensorHelper.GetTensorValue(poseTensor, poseArr);
-
-                        var partThreshold = PartMinConfidence;
-                        var centroidThreshold = CentroidMinConfidence;
-
-                        // Loop the available identifications
-                        for (int i = 0; i < centroidArr.GetLength(0); i++)
-                        {
-                            var pose = new Pose(input[0], config);
-                            var centroid = new BodyPart();
-                            centroid.Name = config.AnchorName;
-                            centroid.Confidence = centroidConfArr[0];
-                            if (centroid.Confidence < centroidThreshold)
+                            var bodyPart = new BodyPart();
+                            bodyPart.Name = exportMetadata.PartNames[j];
+                            bodyPart.Confidence = partConfTensor.GetValue(i * partCount + j);
+                            if (bodyPart.Confidence < partThreshold)
                             {
-                                centroid.Position = new Point2f(float.NaN, float.NaN);
+                                bodyPart.Position = new Point2f(float.NaN, float.NaN);
                             }
                             else
                             {
-                                centroid.Position = new Point2f(
-                                    x: (float)(centroidArr[i, 0] * poseScale),
-                                    y: (float)(centroidArr[i, 1] * poseScale));
+                                bodyPart.Position = new Point2f(
+                                    x: (float)poseTensor.GetValue(i * partCount * 2 + j * 2),
+                                    y: (float)poseTensor.GetValue(i * partCount * 2 + j * 2 + 1));
                             }
-                            pose.Centroid = centroid;
-
-                            // Iterate on the body parts
-                            for (int bodyPartIdx = 0; bodyPartIdx < poseArr.GetLength(1); bodyPartIdx++)
-                            {
-                                var bodyPart = new BodyPart();
-                                bodyPart.Name = config.PartNames[bodyPartIdx];
-                                bodyPart.Confidence = partConfArr[i, bodyPartIdx];
-                                if (bodyPart.Confidence < partThreshold)
-                                {
-                                    bodyPart.Position = new Point2f(float.NaN, float.NaN);
-                                }
-                                else
-                                {
-                                    bodyPart.Position = new Point2f(
-                                        x: (float)(poseArr[i, bodyPartIdx, 0] * poseScale),
-                                        y: (float)(poseArr[i, bodyPartIdx, 1] * poseScale));
-                                }
-                                pose.Add(bodyPart);
-                            }
-                            poseCollection.Add(pose);
-                        };
-                        return poseCollection;
+                            pose.Add(bodyPart);
+                        }
+                        poseCollection.Add(pose);
                     }
+                    return poseCollection;
                 });
             });
         }
